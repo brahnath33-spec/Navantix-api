@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.Python
+
+# Environment
+.env
+.env.local
+
+# Model files (we'll handle separately later)
+*.pth
+*.pt
+*.onnx
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Uploads (test data, do not commit)
+uploads/
+temp/
