@@ -9,15 +9,15 @@ import traceback
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torchvision
 import skimage
+import cv2
+from scipy.ndimage import binary_fill_holes
 from PIL import Image
 import torchxrayvision as xrv
 from pytorch_grad_cam import GradCAMPlusPlus
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-from scipy.ndimage import gaussian_filter
 
 import open_clip
 
@@ -25,7 +25,6 @@ import open_clip
 # GLOBAL STATE
 # ------------------------------------------------------------
 _cxr_model = None
-_seg_model = None
 _clip_model = None
 _clip_preprocess = None
 _clip_tokenizer = None
@@ -69,19 +68,13 @@ NON_CXR_PROMPTS = [
 # ------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _cxr_model, _seg_model, _clip_model, _clip_preprocess, _clip_tokenizer, _clip_text_features
+    global _cxr_model, _clip_model, _clip_preprocess, _clip_tokenizer, _clip_text_features
 
     print("[startup] Loading Navantix Pulmo CXR model...")
     t0 = time.time()
     _cxr_model = xrv.models.DenseNet(weights="densenet121-res224-all")
     _cxr_model.eval()
     print(f"[startup] CXR model ready in {time.time() - t0:.1f}s")
-
-    print("[startup] Loading PSPNet lung segmentation model...")
-    t0 = time.time()
-    _seg_model = xrv.baseline_models.chestx_det.PSPNet()
-    _seg_model.eval()
-    print(f"[startup] Segmentation model ready in {time.time() - t0:.1f}s")
 
     print("[startup] Loading CLIP modality checker...")
     t0 = time.time()
@@ -98,6 +91,7 @@ async def lifespan(app: FastAPI):
         tf /= tf.norm(dim=-1, keepdim=True)
         _clip_text_features = tf
     print(f"[startup] CLIP ready in {time.time() - t0:.1f}s")
+
     print("[startup] All models loaded. Server ready.")
     yield
     print("[shutdown] Bye.")
@@ -126,7 +120,7 @@ app.add_middleware(
 
 
 # ------------------------------------------------------------
-# HELPERS
+# HELPERS — IMAGE PREPROCESSING
 # ------------------------------------------------------------
 def prepare_xray(img_array: np.ndarray) -> torch.Tensor:
     if len(img_array.shape) == 3:
@@ -182,79 +176,9 @@ def tensor_to_base64_png(img_array: np.ndarray) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def compute_lung_mask(input_image: Image.Image, target_size: tuple) -> np.ndarray:
-    """
-    Run PSPNet segmentation and return a soft float mask (H, W)
-    where values near 1 = lung/heart tissue, 0 = background.
-    """
-    h, w = target_size
-
-    if _seg_model is None:
-        return np.ones((h, w), dtype=np.float32)
-
-    try:
-        # PSPNet expects a 512x512 grayscale image
-        seg_input = input_image.convert("L").resize((512, 512))
-        arr = np.array(seg_input).astype(np.float32)
-        arr = xrv.datasets.normalize(arr, 255)
-        tensor = torch.from_numpy(arr[None, None, ...])
-
-        with torch.no_grad():
-            output = _seg_model(tensor)
-
-        # output shape: [1, 14, 512, 512]
-        targets = list(_seg_model.targets)
-        lung_idx = []
-        for name in ["Left Lung", "Right Lung", "Heart"]:
-            if name in targets:
-                lung_idx.append(targets.index(name))
-
-        if not lung_idx:
-            return np.ones((h, w), dtype=np.float32)
-
-        probs = torch.sigmoid(output[0]).cpu().numpy()   # (14, 512, 512)
-        lung_channels = probs[lung_idx]                  # (n, 512, 512)
-        combined = lung_channels.max(axis=0)             # (512, 512)
-        binary_mask = (combined > 0.5).astype(np.float32)
-
-        # Smooth edges
-        smoothed = gaussian_filter(binary_mask, sigma=4)
-        smoothed = np.clip(smoothed, 0.0, 1.0)
-
-        # Resize to original image size
-        mask_pil = Image.fromarray((smoothed * 255).astype(np.uint8))
-        mask_pil = mask_pil.resize((w, h), Image.BILINEAR)
-        return np.array(mask_pil).astype(np.float32) / 255.0
-
-    except Exception as e:
-        print(f"[warn] Segmentation failed, using full mask: {e}")
-        return np.ones((h, w), dtype=np.float32)
-
-
-def mc_dropout_predict(model, tensor, n_passes: int = MC_PASSES, p: float = MC_DROPOUT_P):
-    """
-    Run N forward passes with dropout applied at the classifier input.
-    Returns (mean_scores, std_scores) as numpy arrays of shape (n_labels,).
-    """
-    predictions = []
-
-    def _dropout_hook(module, inputs):
-        x = inputs[0]
-        return (F.dropout(x, p=p, training=True),)
-
-    handle = model.classifier.register_forward_pre_hook(_dropout_hook)
-    try:
-        with torch.no_grad():
-            for _ in range(n_passes):
-                out = model(tensor[None, ...])
-                predictions.append(torch.sigmoid(out).cpu().numpy()[0])
-    finally:
-        handle.remove()
-
-    predictions = np.stack(predictions)
-    return predictions.mean(axis=0), predictions.std(axis=0)
-
-
+# ------------------------------------------------------------
+# HELPERS — MODALITY CHECK (CLIP)
+# ------------------------------------------------------------
 def check_modality(pil_image: Image.Image) -> dict:
     if _clip_model is None or _clip_text_features is None:
         return {
@@ -309,6 +233,103 @@ def check_modality(pil_image: Image.Image) -> dict:
 
 
 # ------------------------------------------------------------
+# HELPERS — MC DROPOUT
+# ------------------------------------------------------------
+def mc_dropout_predict(model, tensor, n_passes: int = MC_PASSES, p: float = MC_DROPOUT_P):
+    import torch.nn.functional as F
+
+    predictions = []
+
+    def _dropout_hook(module, inputs):
+        x = inputs[0]
+        return (F.dropout(x, p=p, training=True),)
+
+    handle = model.classifier.register_forward_pre_hook(_dropout_hook)
+    try:
+        with torch.no_grad():
+            for _ in range(n_passes):
+                out = model(tensor[None, ...])
+                predictions.append(torch.sigmoid(out).cpu().numpy()[0])
+    finally:
+        handle.remove()
+
+    predictions = np.stack(predictions)
+    return predictions.mean(axis=0), predictions.std(axis=0)
+
+
+# ------------------------------------------------------------
+# HELPERS — LUNG SEGMENTATION
+# ------------------------------------------------------------
+def compute_lung_mask(pil_image: Image.Image, feather: int = 15) -> np.ndarray:
+    img = np.array(pil_image.convert("L"))
+    h, w = img.shape
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    img_eq = clahe.apply(img)
+
+    blur_kernel = max(11, (min(h, w) // 40) | 1)
+    img_blur = cv2.GaussianBlur(img_eq, (blur_kernel, blur_kernel), 0)
+
+    _, thresh = cv2.threshold(img_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    mask = 255 - thresh
+
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close, iterations=2)
+
+    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open, iterations=1)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+
+    if num_labels > 3:
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        top_two = np.argsort(areas)[-2:] + 1
+        new_mask = np.zeros_like(mask)
+        for lid in top_two:
+            new_mask[labels == lid] = 255
+        mask = new_mask
+
+    mask_bool = mask > 0
+    mask_bool = binary_fill_holes(mask_bool)
+
+    k_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    mask_dilated = cv2.dilate(mask_bool.astype(np.uint8) * 255, k_dilate, iterations=1)
+
+    mask_float = mask_dilated.astype(np.float32) / 255.0
+    if feather > 0:
+        feather = feather if feather % 2 == 1 else feather + 1
+        mask_float = cv2.GaussianBlur(mask_float, (feather, feather), 0)
+
+    return np.clip(mask_float, 0.0, 1.0)
+
+
+def blend_heatmap_with_mask(
+    heatmap_rgb: np.ndarray,
+    original_rgb: np.ndarray,
+    lung_mask: np.ndarray,
+) -> np.ndarray:
+    """
+    Show heatmap inside the lung mask; keep the original radiograph outside.
+    Smooth blend at mask edges.
+    """
+    h, w = heatmap_rgb.shape[:2]
+
+    if lung_mask.shape[:2] != (h, w):
+        lung_mask = cv2.resize(lung_mask, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    if original_rgb.shape[:2] != (h, w):
+        original_rgb = cv2.resize(original_rgb, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    mask3 = np.stack([lung_mask] * 3, axis=-1).astype(np.float32)
+
+    blended = (
+        heatmap_rgb.astype(np.float32) * mask3
+        + original_rgb.astype(np.float32) * (1.0 - mask3)
+    )
+    return np.clip(blended, 0, 255).astype(np.uint8)
+
+
+# ------------------------------------------------------------
 # ROUTES
 # ------------------------------------------------------------
 @app.get("/")
@@ -327,7 +348,6 @@ def health():
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "model": "densenet121-res224-all",
         "model_loaded": _cxr_model is not None,
-        "segmentation_loaded": _seg_model is not None,
         "modality_check": _clip_model is not None,
     }
 
@@ -406,7 +426,20 @@ async def _predict_impl(file: UploadFile):
     top_std = pairs[0][2]
     flagged = top_score >= CLINICAL_THRESHOLD
 
-    # -------- Step 3: Grad-CAM++ with lung masking --------
+    # -------- Step 3: Lung mask --------
+    lung_mask = None
+    try:
+        lung_mask = compute_lung_mask(input_image)
+        mask_coverage = float(lung_mask.mean())
+        print(f"[info] Lung mask coverage: {mask_coverage * 100:.1f}%")
+        if mask_coverage < 0.05:
+            print("[warn] Lung mask too small — skipping masking")
+            lung_mask = None
+    except Exception as e:
+        print(f"[warn] Lung mask skipped: {e}")
+        lung_mask = None
+
+    # -------- Step 4: Grad-CAM++ for top N findings --------
     heatmap_b64 = None
     heatmaps_by_label = {}
 
@@ -416,10 +449,8 @@ async def _predict_impl(file: UploadFile):
 
         original = np.array(input_image)
         h, w = original.shape
-        rgb = np.stack([original / 255.0] * 3, axis=-1).astype(np.float32)
-
-        # Build anatomical mask once — reused for every finding
-        lung_mask = compute_lung_mask(input_image, (h, w))
+        rgb_float = np.stack([original / 255.0] * 3, axis=-1).astype(np.float32)
+        rgb_uint8 = (rgb_float * 255.0).astype(np.uint8)
 
         for label, _mean, _std in pairs[:HEATMAP_TOP_N]:
             try:
@@ -433,10 +464,13 @@ async def _predict_impl(file: UploadFile):
                 cam_pil = cam_pil.resize((w, h), Image.BILINEAR)
                 cam_full = np.array(cam_pil).astype(np.float32) / 255.0
 
-                # Apply anatomical mask — only allow heatmap inside lung/heart
-                cam_full = cam_full * lung_mask
+                overlay = show_cam_on_image(rgb_float, cam_full, use_rgb=True)
 
-                overlay = show_cam_on_image(rgb, cam_full, use_rgb=True)
+                if lung_mask is not None:
+                    overlay = blend_heatmap_with_mask(
+                        overlay, rgb_uint8, lung_mask
+                    )
+
                 heatmaps_by_label[label] = tensor_to_base64_png(overlay)
 
                 if label == top_finding:
@@ -462,4 +496,5 @@ async def _predict_impl(file: UploadFile):
         "heatmaps": heatmaps_by_label,
         "modality": modality,
         "mc_passes": MC_PASSES,
+        "lung_mask_applied": lung_mask is not None,
     }
