@@ -9,11 +9,12 @@ import traceback
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchvision
 import skimage
 from PIL import Image
 import torchxrayvision as xrv
-from pytorch_grad_cam import GradCAM, GradCAMPlusPlus
+from pytorch_grad_cam import GradCAMPlusPlus
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 
@@ -31,6 +32,8 @@ _clip_text_features = None
 CLINICAL_THRESHOLD = 0.5
 MODALITY_THRESHOLD = 0.5
 HEATMAP_TOP_N = 5
+MC_PASSES = 10
+MC_DROPOUT_P = 0.3
 
 CXR_PROMPTS = [
     "a chest x-ray radiograph",
@@ -87,7 +90,6 @@ async def lifespan(app: FastAPI):
         tf /= tf.norm(dim=-1, keepdim=True)
         _clip_text_features = tf
     print(f"[startup] CLIP ready in {time.time() - t0:.1f}s")
-
     print("[startup] All models loaded. Server ready.")
     yield
     print("[shutdown] Bye.")
@@ -157,11 +159,43 @@ def severity_from_score(score: float) -> str:
     return "low"
 
 
+def confidence_from_std(std: float) -> str:
+    if std < 0.03:
+        return "high"
+    if std < 0.08:
+        return "medium"
+    return "low"
+
+
 def tensor_to_base64_png(img_array: np.ndarray) -> str:
     img = Image.fromarray(img_array.astype(np.uint8))
     buf = BytesIO()
     img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def mc_dropout_predict(model, tensor, n_passes: int = MC_PASSES, p: float = MC_DROPOUT_P):
+    """
+    Run N forward passes with dropout applied at the classifier input.
+    Returns (mean_scores, std_scores) as numpy arrays of shape (n_labels,).
+    """
+    predictions = []
+
+    def _dropout_hook(module, inputs):
+        x = inputs[0]
+        return (F.dropout(x, p=p, training=True),)
+
+    handle = model.classifier.register_forward_pre_hook(_dropout_hook)
+    try:
+        with torch.no_grad():
+            for _ in range(n_passes):
+                out = model(tensor[None, ...])
+                predictions.append(torch.sigmoid(out).cpu().numpy()[0])
+    finally:
+        handle.remove()
+
+    predictions = np.stack(predictions)
+    return predictions.mean(axis=0), predictions.std(axis=0)
 
 
 def check_modality(pil_image: Image.Image) -> dict:
@@ -286,30 +320,35 @@ async def _predict_impl(file: UploadFile):
             "heatmaps": {},
         }
 
-    # -------- Step 2: Inference --------
+    # -------- Step 2: Inference with MC Dropout --------
     t0 = time.time()
     img_array = np.array(input_image)
     tensor = prepare_xray(img_array)
 
-    with torch.no_grad():
-        outputs = _cxr_model(tensor[None, ...])
-    scores = outputs[0].numpy()
+    mean_scores, std_scores = mc_dropout_predict(
+        _cxr_model, tensor, n_passes=MC_PASSES, p=MC_DROPOUT_P
+    )
 
-    pairs = sorted(zip(_cxr_model.pathologies, scores), key=lambda x: -x[1])
+    indexed = list(zip(_cxr_model.pathologies, mean_scores, std_scores))
+    indexed.sort(key=lambda x: -x[1])
+    pairs = [(label, float(mean), float(std)) for label, mean, std in indexed]
 
     findings = []
-    for label, score in pairs:
+    for label, mean, std in pairs:
         findings.append({
             "label": label,
-            "score": float(score),
-            "severity": severity_from_score(float(score)),
+            "score": float(mean),
+            "std": float(std),
+            "severity": severity_from_score(float(mean)),
+            "confidence": confidence_from_std(float(std)),
         })
 
     top_finding = pairs[0][0]
-    top_score = float(pairs[0][1])
+    top_score = pairs[0][1]
+    top_std = pairs[0][2]
     flagged = top_score >= CLINICAL_THRESHOLD
 
-    # -------- Step 3: Grad-CAM++ for top N findings --------
+    # -------- Step 3: Grad-CAM++ for top findings --------
     heatmap_b64 = None
     heatmaps_by_label = {}
 
@@ -321,7 +360,7 @@ async def _predict_impl(file: UploadFile):
         h, w = original.shape
         rgb = np.stack([original / 255.0] * 3, axis=-1).astype(np.float32)
 
-        for label, _score in pairs[:HEATMAP_TOP_N]:
+        for label, _mean, _std in pairs[:HEATMAP_TOP_N]:
             try:
                 idx = _cxr_model.pathologies.index(label)
                 grayscale_cam = cam(
@@ -352,9 +391,11 @@ async def _predict_impl(file: UploadFile):
         "threshold": CLINICAL_THRESHOLD,
         "top_finding": top_finding,
         "top_score": top_score,
+        "top_std": top_std,
         "flagged": flagged,
         "findings": findings,
         "heatmap_base64": heatmap_b64,
         "heatmaps": heatmaps_by_label,
         "modality": modality,
+        "mc_passes": MC_PASSES,
     }
