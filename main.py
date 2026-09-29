@@ -17,6 +17,7 @@ import torchxrayvision as xrv
 from pytorch_grad_cam import GradCAMPlusPlus
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+from scipy.ndimage import gaussian_filter
 
 import open_clip
 
@@ -24,6 +25,7 @@ import open_clip
 # GLOBAL STATE
 # ------------------------------------------------------------
 _cxr_model = None
+_seg_model = None
 _clip_model = None
 _clip_preprocess = None
 _clip_tokenizer = None
@@ -67,13 +69,19 @@ NON_CXR_PROMPTS = [
 # ------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _cxr_model, _clip_model, _clip_preprocess, _clip_tokenizer, _clip_text_features
+    global _cxr_model, _seg_model, _clip_model, _clip_preprocess, _clip_tokenizer, _clip_text_features
 
     print("[startup] Loading Navantix Pulmo CXR model...")
     t0 = time.time()
     _cxr_model = xrv.models.DenseNet(weights="densenet121-res224-all")
     _cxr_model.eval()
     print(f"[startup] CXR model ready in {time.time() - t0:.1f}s")
+
+    print("[startup] Loading PSPNet lung segmentation model...")
+    t0 = time.time()
+    _seg_model = xrv.baseline_models.chestx_det.PSPNet()
+    _seg_model.eval()
+    print(f"[startup] Segmentation model ready in {time.time() - t0:.1f}s")
 
     print("[startup] Loading CLIP modality checker...")
     t0 = time.time()
@@ -174,6 +182,55 @@ def tensor_to_base64_png(img_array: np.ndarray) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def compute_lung_mask(input_image: Image.Image, target_size: tuple) -> np.ndarray:
+    """
+    Run PSPNet segmentation and return a soft float mask (H, W)
+    where values near 1 = lung/heart tissue, 0 = background.
+    """
+    h, w = target_size
+
+    if _seg_model is None:
+        return np.ones((h, w), dtype=np.float32)
+
+    try:
+        # PSPNet expects a 512x512 grayscale image
+        seg_input = input_image.convert("L").resize((512, 512))
+        arr = np.array(seg_input).astype(np.float32)
+        arr = xrv.datasets.normalize(arr, 255)
+        tensor = torch.from_numpy(arr[None, None, ...])
+
+        with torch.no_grad():
+            output = _seg_model(tensor)
+
+        # output shape: [1, 14, 512, 512]
+        targets = list(_seg_model.targets)
+        lung_idx = []
+        for name in ["Left Lung", "Right Lung", "Heart"]:
+            if name in targets:
+                lung_idx.append(targets.index(name))
+
+        if not lung_idx:
+            return np.ones((h, w), dtype=np.float32)
+
+        probs = torch.sigmoid(output[0]).cpu().numpy()   # (14, 512, 512)
+        lung_channels = probs[lung_idx]                  # (n, 512, 512)
+        combined = lung_channels.max(axis=0)             # (512, 512)
+        binary_mask = (combined > 0.5).astype(np.float32)
+
+        # Smooth edges
+        smoothed = gaussian_filter(binary_mask, sigma=4)
+        smoothed = np.clip(smoothed, 0.0, 1.0)
+
+        # Resize to original image size
+        mask_pil = Image.fromarray((smoothed * 255).astype(np.uint8))
+        mask_pil = mask_pil.resize((w, h), Image.BILINEAR)
+        return np.array(mask_pil).astype(np.float32) / 255.0
+
+    except Exception as e:
+        print(f"[warn] Segmentation failed, using full mask: {e}")
+        return np.ones((h, w), dtype=np.float32)
+
+
 def mc_dropout_predict(model, tensor, n_passes: int = MC_PASSES, p: float = MC_DROPOUT_P):
     """
     Run N forward passes with dropout applied at the classifier input.
@@ -270,6 +327,7 @@ def health():
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "model": "densenet121-res224-all",
         "model_loaded": _cxr_model is not None,
+        "segmentation_loaded": _seg_model is not None,
         "modality_check": _clip_model is not None,
     }
 
@@ -348,7 +406,7 @@ async def _predict_impl(file: UploadFile):
     top_std = pairs[0][2]
     flagged = top_score >= CLINICAL_THRESHOLD
 
-    # -------- Step 3: Grad-CAM++ for top findings --------
+    # -------- Step 3: Grad-CAM++ with lung masking --------
     heatmap_b64 = None
     heatmaps_by_label = {}
 
@@ -359,6 +417,9 @@ async def _predict_impl(file: UploadFile):
         original = np.array(input_image)
         h, w = original.shape
         rgb = np.stack([original / 255.0] * 3, axis=-1).astype(np.float32)
+
+        # Build anatomical mask once — reused for every finding
+        lung_mask = compute_lung_mask(input_image, (h, w))
 
         for label, _mean, _std in pairs[:HEATMAP_TOP_N]:
             try:
@@ -371,6 +432,9 @@ async def _predict_impl(file: UploadFile):
                 cam_pil = Image.fromarray((grayscale_cam * 255).astype(np.uint8))
                 cam_pil = cam_pil.resize((w, h), Image.BILINEAR)
                 cam_full = np.array(cam_pil).astype(np.float32) / 255.0
+
+                # Apply anatomical mask — only allow heatmap inside lung/heart
+                cam_full = cam_full * lung_mask
 
                 overlay = show_cam_on_image(rgb, cam_full, use_rgb=True)
                 heatmaps_by_label[label] = tensor_to_base64_png(overlay)
