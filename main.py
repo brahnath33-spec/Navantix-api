@@ -3,7 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from datetime import datetime
 from io import BytesIO
+from pathlib import Path
 import base64
+import json
 import time
 import traceback
 
@@ -16,7 +18,6 @@ from scipy.ndimage import binary_fill_holes
 from PIL import Image
 import torchxrayvision as xrv
 from pytorch_grad_cam import GradCAMPlusPlus
-from pytorch_grad_cam.utils.image import show_cam_on_image
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 
 import open_clip
@@ -30,11 +31,14 @@ _clip_preprocess = None
 _clip_tokenizer = None
 _clip_text_features = None
 
-CLINICAL_THRESHOLD = 0.5
+DEFAULT_THRESHOLD = 0.5
 MODALITY_THRESHOLD = 0.5
 HEATMAP_TOP_N = 5
 MC_PASSES = 10
 MC_DROPOUT_P = 0.3
+
+THRESHOLDS_PATH = Path(__file__).parent / "thresholds.json"
+CLASS_THRESHOLDS = {}
 
 CXR_PROMPTS = [
     "a chest x-ray radiograph",
@@ -64,11 +68,36 @@ NON_CXR_PROMPTS = [
 
 
 # ------------------------------------------------------------
+# THRESHOLD LOADING
+# ------------------------------------------------------------
+def load_thresholds() -> dict:
+    if THRESHOLDS_PATH.exists():
+        try:
+            with open(THRESHOLDS_PATH, "r") as f:
+                data = json.load(f)
+            print(f"[startup] Loaded {len(data)} per-class thresholds from {THRESHOLDS_PATH.name}")
+            return {str(k): float(v) for k, v in data.items()}
+        except Exception as e:
+            print(f"[warn] Failed to load thresholds.json: {e}")
+            return {}
+    else:
+        print(f"[warn] thresholds.json not found at {THRESHOLDS_PATH}. Using default {DEFAULT_THRESHOLD}.")
+        return {}
+
+
+def threshold_for(label: str) -> float:
+    return CLASS_THRESHOLDS.get(label, DEFAULT_THRESHOLD)
+
+
+# ------------------------------------------------------------
 # LIFESPAN
 # ------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _cxr_model, _clip_model, _clip_preprocess, _clip_tokenizer, _clip_text_features
+    global _cxr_model, _clip_model, _clip_preprocess, _clip_tokenizer, _clip_text_features, CLASS_THRESHOLDS
+
+    print("[startup] Loading thresholds...")
+    CLASS_THRESHOLDS = load_thresholds()
 
     print("[startup] Loading Navantix Pulmo CXR model...")
     t0 = time.time()
@@ -92,6 +121,10 @@ async def lifespan(app: FastAPI):
         _clip_text_features = tf
     print(f"[startup] CLIP ready in {time.time() - t0:.1f}s")
 
+    missing = [p for p in _cxr_model.pathologies if p not in CLASS_THRESHOLDS]
+    if missing:
+        print(f"[info] Using default {DEFAULT_THRESHOLD} for: {missing}")
+
     print("[startup] All models loaded. Server ready.")
     yield
     print("[shutdown] Bye.")
@@ -102,7 +135,7 @@ async def lifespan(app: FastAPI):
 # ------------------------------------------------------------
 app = FastAPI(
     title="Navantix Pulmo API",
-    version="1.0.0",
+    version="1.1.0",
     description="AI-assisted chest radiograph analysis — research prototype.",
     lifespan=lifespan,
 )
@@ -153,10 +186,10 @@ def prepare_xray(img_array: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(transform(img))
 
 
-def severity_from_score(score: float) -> str:
-    if score >= CLINICAL_THRESHOLD + 0.1:
+def severity_from_score(score: float, threshold: float) -> str:
+    if score >= threshold + 0.10:
         return "high"
-    if score >= CLINICAL_THRESHOLD:
+    if score >= threshold:
         return "moderate"
     return "low"
 
@@ -177,7 +210,7 @@ def tensor_to_base64_png(img_array: np.ndarray) -> str:
 
 
 # ------------------------------------------------------------
-# HELPERS — MODALITY CHECK (CLIP)
+# HELPERS — MODALITY CHECK
 # ------------------------------------------------------------
 def check_modality(pil_image: Image.Image) -> dict:
     if _clip_model is None or _clip_text_features is None:
@@ -258,7 +291,7 @@ def mc_dropout_predict(model, tensor, n_passes: int = MC_PASSES, p: float = MC_D
 
 
 # ------------------------------------------------------------
-# HELPERS — LUNG SEGMENTATION
+# HELPERS — LUNG MASK
 # ------------------------------------------------------------
 def compute_lung_mask(pil_image: Image.Image, feather: int = 15) -> np.ndarray:
     img = np.array(pil_image.convert("L"))
@@ -303,30 +336,76 @@ def compute_lung_mask(pil_image: Image.Image, feather: int = 15) -> np.ndarray:
     return np.clip(mask_float, 0.0, 1.0)
 
 
-def blend_heatmap_with_mask(
-    heatmap_rgb: np.ndarray,
-    original_rgb: np.ndarray,
-    lung_mask: np.ndarray,
+# ------------------------------------------------------------
+# HELPERS — CLINICAL HEATMAP (yellow→orange→red, no rainbow)
+# ------------------------------------------------------------
+def make_clinical_heatmap(
+    original_gray: np.ndarray,
+    grayscale_cam: np.ndarray,
+    lung_mask: np.ndarray = None,
+    alpha: float = 0.75,
+    floor: float = 0.08,
 ) -> np.ndarray:
     """
-    Show heatmap inside the lung mask; keep the original radiograph outside.
-    Smooth blend at mask edges.
+    Clinical-grade Grad-CAM overlay with a custom yellow→orange→red ramp.
+    No rainbow. No visible mask edge. Radiograph stays visible throughout.
     """
-    h, w = heatmap_rgb.shape[:2]
+    h, w = original_gray.shape
 
-    if lung_mask.shape[:2] != (h, w):
-        lung_mask = cv2.resize(lung_mask, (w, h), interpolation=cv2.INTER_LINEAR)
+    # 1. Upsample the low-res CAM smoothly
+    cam_pil = Image.fromarray((grayscale_cam * 255).astype(np.uint8))
+    cam_pil = cam_pil.resize((w, h), Image.BICUBIC)
+    cam = np.array(cam_pil).astype(np.float32) / 255.0
 
-    if original_rgb.shape[:2] != (h, w):
-        original_rgb = cv2.resize(original_rgb, (w, h), interpolation=cv2.INTER_LINEAR)
+    # 2. Heavy Gaussian smoothing — removes 14x14 grid blocks
+    cam = cv2.GaussianBlur(cam, (0, 0), sigmaX=20, sigmaY=20)
 
-    mask3 = np.stack([lung_mask] * 3, axis=-1).astype(np.float32)
+    # 3. Normalize
+    cam = np.clip(cam, 0, 1)
+    if cam.max() > 1e-6:
+        cam = cam / cam.max()
+
+    # 4. Soft lung mask
+    if lung_mask is not None:
+        mask_resized = cv2.resize(lung_mask, (w, h), interpolation=cv2.INTER_LINEAR)
+        mask_soft = cv2.GaussianBlur(mask_resized, (0, 0), sigmaX=55, sigmaY=55)
+        mask_soft = np.clip(mask_soft * 1.7, 0, 1)
+        cam = cam * (0.35 + 0.65 * mask_soft)
+
+    # 5. Gentle gamma — keeps low activations visible
+    cam = np.clip(cam, 0, 1) ** 1.15
+
+    # 6. Floor threshold
+    visible = np.clip((cam - floor) / (1.0 - floor), 0, 1)
+
+    # 7. Custom yellow→orange→red ramp
+    v = visible[..., None]
+
+    c0 = np.array([255, 236, 120], dtype=np.float32)   # pale yellow
+    c1 = np.array([255, 165, 30],  dtype=np.float32)   # orange
+    c2 = np.array([200, 20, 20],   dtype=np.float32)   # deep red
+
+    v2 = np.clip(v * 2.0, 0, 1)
+    v3 = np.clip((v - 0.5) * 2.0, 0, 1)
+
+    color_first = c0 * (1 - v2) + c1 * v2
+    color_second = c1 * (1 - v3) + c2 * v3
+
+    first_half = np.clip(1.0 - v * 2.0, 0, 1)
+    second_half = np.clip(v * 2.0 - 1.0, 0, 1)
+
+    heatmap_rgb = color_first * first_half + color_second * second_half
+
+    # 8. Blend with original radiograph, weighted by activation
+    original_rgb = np.stack([original_gray] * 3, axis=-1).astype(np.float32)
+    weight = np.stack([visible * alpha] * 3, axis=-1)
 
     blended = (
-        heatmap_rgb.astype(np.float32) * mask3
-        + original_rgb.astype(np.float32) * (1.0 - mask3)
-    )
-    return np.clip(blended, 0, 255).astype(np.uint8)
+        heatmap_rgb * weight
+        + original_rgb * (1.0 - weight)
+    ).clip(0, 255).astype(np.uint8)
+
+    return blended
 
 
 # ------------------------------------------------------------
@@ -336,8 +415,9 @@ def blend_heatmap_with_mask(
 def root():
     return {
         "service": "navantix-pulmo-api",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "status": "online",
+        "per_class_thresholds": len(CLASS_THRESHOLDS),
     }
 
 
@@ -349,6 +429,15 @@ def health():
         "model": "densenet121-res224-all",
         "model_loaded": _cxr_model is not None,
         "modality_check": _clip_model is not None,
+        "thresholds_loaded": len(CLASS_THRESHOLDS),
+    }
+
+
+@app.get("/thresholds")
+def get_thresholds():
+    return {
+        "default": DEFAULT_THRESHOLD,
+        "per_class": CLASS_THRESHOLDS,
     }
 
 
@@ -412,19 +501,27 @@ async def _predict_impl(file: UploadFile):
     pairs = [(label, float(mean), float(std)) for label, mean, std in indexed]
 
     findings = []
+    flagged_count = 0
     for label, mean, std in pairs:
+        t = threshold_for(label)
+        is_flagged = mean >= t
+        if is_flagged:
+            flagged_count += 1
         findings.append({
             "label": label,
             "score": float(mean),
             "std": float(std),
-            "severity": severity_from_score(float(mean)),
+            "threshold": float(t),
+            "severity": severity_from_score(float(mean), float(t)),
             "confidence": confidence_from_std(float(std)),
+            "flagged": bool(is_flagged),
         })
 
     top_finding = pairs[0][0]
     top_score = pairs[0][1]
     top_std = pairs[0][2]
-    flagged = top_score >= CLINICAL_THRESHOLD
+    top_threshold = threshold_for(top_finding)
+    flagged = flagged_count > 0
 
     # -------- Step 3: Lung mask --------
     lung_mask = None
@@ -439,7 +536,7 @@ async def _predict_impl(file: UploadFile):
         print(f"[warn] Lung mask skipped: {e}")
         lung_mask = None
 
-    # -------- Step 4: Grad-CAM++ for top N findings --------
+    # -------- Step 4: Grad-CAM++ with clinical heatmap --------
     heatmap_b64 = None
     heatmaps_by_label = {}
 
@@ -449,8 +546,6 @@ async def _predict_impl(file: UploadFile):
 
         original = np.array(input_image)
         h, w = original.shape
-        rgb_float = np.stack([original / 255.0] * 3, axis=-1).astype(np.float32)
-        rgb_uint8 = (rgb_float * 255.0).astype(np.uint8)
 
         for label, _mean, _std in pairs[:HEATMAP_TOP_N]:
             try:
@@ -460,16 +555,13 @@ async def _predict_impl(file: UploadFile):
                     targets=[ClassifierOutputTarget(idx)],
                 )[0]
 
-                cam_pil = Image.fromarray((grayscale_cam * 255).astype(np.uint8))
-                cam_pil = cam_pil.resize((w, h), Image.BILINEAR)
-                cam_full = np.array(cam_pil).astype(np.float32) / 255.0
-
-                overlay = show_cam_on_image(rgb_float, cam_full, use_rgb=True)
-
-                if lung_mask is not None:
-                    overlay = blend_heatmap_with_mask(
-                        overlay, rgb_uint8, lung_mask
-                    )
+                overlay = make_clinical_heatmap(
+                    original_gray=original,
+                    grayscale_cam=grayscale_cam,
+                    lung_mask=lung_mask,
+                    alpha=0.75,
+                    floor=0.08,
+                )
 
                 heatmaps_by_label[label] = tensor_to_base64_png(overlay)
 
@@ -486,15 +578,18 @@ async def _predict_impl(file: UploadFile):
         "filename": file.filename,
         "rejected": False,
         "elapsed_ms": round(elapsed_ms, 1),
-        "threshold": CLINICAL_THRESHOLD,
+        "threshold_default": DEFAULT_THRESHOLD,
         "top_finding": top_finding,
         "top_score": top_score,
         "top_std": top_std,
+        "top_threshold": top_threshold,
         "flagged": flagged,
+        "flagged_count": flagged_count,
         "findings": findings,
         "heatmap_base64": heatmap_b64,
         "heatmaps": heatmaps_by_label,
         "modality": modality,
         "mc_passes": MC_PASSES,
         "lung_mask_applied": lung_mask is not None,
+        "thresholds_source": "per_class" if CLASS_THRESHOLDS else "default",
     }

@@ -1,0 +1,20 @@
+{
+  "Atelectasis": 0.55,
+  "Cardiomegaly": 0.53,
+  "Effusion": 0.55,
+  "Infiltration": 0.60,
+  "Mass": 0.60,
+  "Nodule": 0.55,
+  "Pneumonia": 0.65,
+  "Pneumothorax": 0.55,
+  "Consolidation": 0.60,
+  "Edema": 0.58,
+  "Emphysema": 0.55,
+  "Fibrosis": 0.58,
+  "Pleural_Thickening": 0.60,
+  "Hernia": 0.75,
+  "Lung Lesion": 0.62,
+  "Lung Opacity": 0.62,
+  "Fracture": 0.68,
+  "Enlarged Cardiomediastinum": 0.58
+}
